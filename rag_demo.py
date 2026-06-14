@@ -674,7 +674,7 @@ def generate_answer(question, retrieved_chunks, groq_client, model="llama-3.1-8b
             {"role": "user",   "content": user_message},
         ],
         max_tokens=512,   # maximum tokens in the generated response
-        temperature=0.2,  # low temperature → more focused, less creative
+        temperature=0.9,  # low temperature → more focused, less creative
     )
 
     # Extract the answer text from the response object
