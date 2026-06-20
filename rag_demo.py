@@ -18,33 +18,39 @@
 #
 # PIPELINE (end-to-end flow):
 # ---------------------------
-#   Documents (text)
+#   Documents (text OR images)
 #        ↓
-#   Chunking (split into small pieces)
+#   Chunking / Image encoding (split text into pieces; encode images to base64)
 #        ↓
-#   Embedding (convert each chunk to a vector / numbers)
+#   Embedding (convert each chunk/image to a vector using CLIP multimodal model)
 #        ↓
 #   Vector Store (store vectors in memory for fast search)
 #        ↓
 #   User asks a question
 #        ↓
-#   Question → Embedding → Search vector store → Top-K chunks retrieved
+#   Question → Embedding → Search vector store → Top-K chunks/images retrieved
 #        ↓
-#   Prompt = "Use this context: <chunks> \n Answer: <question>"
+#   Prompt = "Use this context: <chunks + images> \n Answer: <question>"
 #        ↓
-#   LLM (Groq / LLaMA3) generates the final answer
+#   LLM (Groq / LLaMA3-Vision) generates the final answer
 #
 # COMPONENTS USED IN THIS SCRIPT:
 # --------------------------------
-#   • sentence-transformers  — HuggingFace library to create text embeddings
+#   • sentence-transformers  — HuggingFace library; now using CLIP for multimodal embeddings
 #   • numpy                  — for vector math (cosine similarity search)
-#   • groq (Python SDK)      — to call the Groq LLM API
+#   • groq (Python SDK)      — to call the Groq LLM API (vision-capable model)
 #   • os / getpass           — to read the API key from environment variables
+#   • base64                 — to encode images for the Groq vision API
+#   • pdf2image + pytesseract — OCR fallback for scanned/image-based PDFs
+#   • PIL (Pillow)           — to open and pre-process image files
 #
 # HOW TO RUN:
 # -----------
 #   1. Install dependencies:
-#        pip install sentence-transformers numpy groq
+#        pip install sentence-transformers numpy groq pypdf python-docx
+#        pip install Pillow pdf2image pytesseract
+#        (Windows: also install Tesseract OCR from https://github.com/UB-Mannheim/tesseract/wiki)
+#        (Windows: also install Poppler from https://github.com/oschwartz10612/poppler-windows/releases)
 #
 #   2. Set your Groq API key (get a free one at https://console.groq.com):
 #        Windows PowerShell:   $env:GROQ_API_KEY = "your_key_here"
@@ -60,6 +66,7 @@
 import os        # Used to read environment variables (e.g., GROQ_API_KEY)
 import sys       # Used to exit the script cleanly on errors
 import textwrap  # Used to wrap long text output neatly in the terminal
+import base64    # [NEW] Used to encode image bytes to base64 for the Groq vision API
 from pathlib import Path  # Used to locate the .env file relative to this script
 
 # --- THIRD-PARTY IMPORTS -----------------------------------------------------
@@ -80,7 +87,11 @@ try:
     # SentenceTransformer loads a pre-trained HuggingFace embedding model.
     # It converts a string of text → a list of numbers (a "vector").
     # Similar texts produce vectors that are close together in vector space.
-    # Model used: 'all-MiniLM-L6-v2' — small (80MB), fast, runs fully offline.
+    #
+    # [CHANGED] The model is now 'clip-ViT-B-32' (multimodal) instead of 'all-MiniLM-L6-v2' (text only).
+    # CLIP (Contrastive Language-Image Pretraining) by OpenAI maps BOTH text and images
+    # into the same 512-dimensional vector space, so text queries can retrieve image chunks
+    # and vice versa. The old text-only model is commented out below at load_embedding_model().
 except ImportError:
     print("ERROR: 'sentence-transformers' is not installed.")
     print("Run: pip install sentence-transformers")
@@ -91,6 +102,10 @@ try:
     # Groq is the Python SDK for calling the Groq LLM API.
     # Groq provides free, very fast inference for open-source models like LLaMA3.
     # We use it to generate the final natural-language answer.
+    #
+    # [CHANGED] We now use 'meta-llama/llama-4-scout-17b-16e-instruct' instead of 'llama-3.1-8b-instant'.
+    # The vision model can receive base64-encoded images alongside text in the same API call,
+    # enabling true multimodal Q&A over image content.
 except ImportError:
     print("ERROR: 'groq' is not installed. Run: pip install groq")
     sys.exit(1)
@@ -100,6 +115,7 @@ try:
     # pypdf reads PDF files page by page and extracts their text content.
     # PdfReader opens the file; .pages gives a list of page objects;
     # page.extract_text() returns the text on that page as a plain string.
+    # NOTE: For scanned/image PDFs, extract_text() returns "". We now fall back to OCR.
 except ImportError:
     print("ERROR: 'pypdf' is not installed. Run: pip install pypdf")
     sys.exit(1)
@@ -113,54 +129,118 @@ except ImportError:
     print("ERROR: 'python-docx' is not installed. Run: pip install python-docx")
     sys.exit(1)
 
+# [NEW] Pillow — image loading and preprocessing
+try:
+    from PIL import Image
+    # Pillow (PIL fork) opens common image formats: PNG, JPG, GIF, WebP, etc.
+    # We use it to open image files and convert them to RGB before encoding.
+except ImportError:
+    print("WARNING: 'Pillow' is not installed. Image file support will be disabled.")
+    print("Run: pip install Pillow")
+    Image = None  # graceful degradation: image loading functions will skip
+
+# [NEW] pymupdf (fitz) — renders PDF pages to pixel images for vision LLM.
+# Self-contained: no Poppler or Tesseract needed.
+# Install: pip install pymupdf
+try:
+    import fitz  # pymupdf
+    _FITZ_AVAILABLE = True
+except ImportError:
+    print("WARNING: 'pymupdf' not installed. Scanned PDF pages will be skipped.")
+    print("Run: pip install pymupdf")
+    _FITZ_AVAILABLE = False
+
 
 # =============================================================================
-# STEP 0 — DOCUMENT LOADER (load text from PDF or Word files)
+# STEP 0 — DOCUMENT LOADER (load text from PDF, Word, or Image files)
 # =============================================================================
 #
-# This section adds support for loading EXTERNAL documents (PDF / .docx) so
-# the RAG system can answer questions about YOUR files instead of (or in
-# addition to) the hardcoded study documents.
+# [CHANGED] This section now supports three document types:
+#   - PDF files   (.pdf)  — text extraction; scanned pages rendered to images via pymupdf
+#   - Word files  (.docx) — paragraph text extraction (unchanged)
+#   - Image files (.png, .jpg, .jpeg, .gif, .webp) — base64 encoded for vision LLM
 #
 # HOW IT WORKS:
-#   - load_pdf(path)  → reads every page of a PDF and returns text as a string
-#   - load_docx(path) → reads every paragraph of a Word doc and returns text
-#   - load_documents_from_files(paths) → auto-detects file type, returns a
-#                                        list of text strings (one per file)
-#
-# The returned text strings are then added to the DOCUMENTS list and go
-# through the same chunking → embedding → vector store pipeline as the
-# hardcoded documents.
+#   - load_pdf(path)   → returns (text_str, [image_dicts]) — text pages as text,
+#                        scanned/image pages rendered by pymupdf as image dicts
+#   - load_docx(path)  → reads every paragraph (unchanged from before)
+#   - load_image(path) → reads image file, returns a special dict with base64 data
+#   - load_documents_from_files(paths) → auto-detects file type, returns a list of
+#                                        text strings OR image dicts
 
-def load_pdf(file_path: str) -> str:
+def load_pdf(file_path: str) -> tuple:
     """
-    Extract all text from a PDF file.
+    Extract content from a PDF file.
+
+    Strategy:
+      - For each page, first try pypdf text extraction (instant, no dependencies).
+      - If a page has no extractable text (scanned page, image-only page, diagram),
+        render it to a PNG using pymupdf (fitz) and return it as an image dict.
+        The Groq vision LLM will then read the image directly — no OCR needed.
+
+    Why pymupdf instead of pdf2image + pytesseract?
+      - pymupdf is self-contained (pip install pymupdf) — no Poppler or Tesseract.
+      - Rendering to image + sending to vision LLM is more accurate than OCR for
+        diagrams, tables, and mixed-layout documents.
 
     Parameters:
         file_path (str): absolute or relative path to the .pdf file
 
     Returns:
-        text (str): all page text joined together, or empty string on failure
+        text      (str)  : joined text from all text-layer pages
+        img_pages (list) : image dicts (type='image') for pages with no text
     """
     print(f"  [PDF] Reading: {file_path}")
     reader = PdfReader(file_path)
-    # reader.pages is a list — one PageObject per page in the PDF
     pages_text = []
+    img_pages = []
+
+    # Open same file with pymupdf for rendering image-based pages
+    fitz_doc = fitz.open(file_path) if _FITZ_AVAILABLE else None
+
     for i, page in enumerate(reader.pages):
-        # extract_text() returns the raw text on this page.
-        # Some PDFs (scanned images) return empty string — we skip those.
+        # extract_text() returns the raw text layer — empty string for scanned pages
         text = page.extract_text()
+
         if text and text.strip():
+            # Page has a text layer — use it directly (same as before)
             pages_text.append(text.strip())
-    combined = "\n\n".join(pages_text)  # join pages with blank line between them
-    print(f"  [PDF] Extracted {len(reader.pages)} pages, "
-          f"{len(combined):,} characters of text.")
-    return combined
+        else:
+            # Page is image-based (scanned, diagram, chart, etc.)
+            if fitz_doc:
+                # [NEW] Render the page to a PNG image using pymupdf
+                # Matrix(2, 2) = 2× zoom = 144 DPI — good quality without huge file size
+                print(f"  [PDF] Page {i+1} has no text — rendering as image for vision LLM...")
+                try:
+                    fitz_page = fitz_doc[i]
+                    mat = fitz.Matrix(2, 2)
+                    pix = fitz_page.get_pixmap(matrix=mat, alpha=False)
+                    png_bytes = pix.tobytes("png")
+                    b64_data = base64.b64encode(png_bytes).decode("utf-8")
+                    img_pages.append({
+                        "type": "image",
+                        "path": f"{Path(file_path).name} — page {i+1}",
+                        "mime_type": "image/png",
+                        "b64_data": b64_data,
+                    })
+                    print(f"  [PDF] Page {i+1} rendered: {len(png_bytes):,} bytes")
+                except Exception as e:
+                    print(f"  [PDF] Failed to render page {i+1}: {e}")
+            else:
+                print(f"  [PDF] Page {i+1} has no text. Install pymupdf to read it: pip install pymupdf")
+
+    if fitz_doc:
+        fitz_doc.close()
+
+    combined = "\n\n".join(pages_text)
+    print(f"  [PDF] {len(reader.pages)} pages: {len(pages_text)} text pages, {len(img_pages)} image pages.")
+    return combined, img_pages
 
 
 def load_docx(file_path: str) -> str:
     """
     Extract all text from a Word (.docx) file.
+    [UNCHANGED] This function is exactly as before — Word docs are text-based.
 
     Parameters:
         file_path (str): absolute or relative path to the .docx file
@@ -179,15 +259,85 @@ def load_docx(file_path: str) -> str:
     return combined
 
 
-def load_documents_from_files(file_paths: list) -> list:
+def load_image(file_path: str) -> dict | None:
     """
-    Load text from a list of PDF and/or Word file paths.
+    [NEW] Load an image file and encode it as base64 for the Groq vision API.
+
+    Why base64? The Groq vision API (like most multimodal LLM APIs) accepts images
+    as base64-encoded strings inside the message content array. This lets us send
+    image data inline without needing a public URL.
+
+    The returned dict has a special 'type': 'image' key so downstream code can
+    distinguish image chunks from text chunks and handle them differently when
+    building the LLM prompt.
 
     Parameters:
-        file_paths (list of str): paths to .pdf or .docx files
+        file_path (str): absolute path to a .png, .jpg, .jpeg, .gif, or .webp file
 
     Returns:
-        documents (list of str): one text string per successfully loaded file
+        dict with keys:
+            'type'      : 'image'
+            'path'      : original file path (for display)
+            'mime_type' : e.g. 'image/jpeg'
+            'b64_data'  : base64-encoded image bytes as a string
+        or None if Pillow is not installed or the file cannot be opened
+    """
+    if Image is None:
+        print(f"  [IMAGE] Skipping {file_path} — Pillow not installed.")
+        return None
+
+    suffix = Path(file_path).suffix.lower()
+    mime_map = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    mime_type = mime_map.get(suffix, "image/jpeg")
+
+    print(f"  [IMAGE] Loading: {file_path}")
+    try:
+        # Open the image with Pillow and convert to RGB
+        # (Some images are RGBA or palette mode — RGB is universally supported)
+        img = Image.open(file_path).convert("RGB")
+
+        # Save the image to an in-memory byte buffer as JPEG
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG" if mime_type != "image/png" else "PNG")
+        img_bytes = buf.getvalue()
+
+        # base64.b64encode() converts raw bytes → base64 bytes
+        # .decode("utf-8") turns those bytes into a plain Python string
+        b64_data = base64.b64encode(img_bytes).decode("utf-8")
+
+        print(f"  [IMAGE] Encoded {len(img_bytes):,} bytes → {len(b64_data):,} base64 chars")
+        return {
+            "type": "image",
+            "path": file_path,
+            "mime_type": mime_type,
+            "b64_data": b64_data,
+        }
+    except Exception as e:
+        print(f"  [IMAGE] Failed to load {file_path}: {e}")
+        return None
+
+
+def load_documents_from_files(file_paths: list) -> list:
+    """
+    Load text OR image data from a list of file paths.
+
+    [CHANGED] Previously only supported .pdf and .docx.
+    Now also handles image files (.png, .jpg, .jpeg, .gif, .webp) by calling
+    load_image() which returns a dict instead of a string. The returned list
+    can contain a mix of strings (text docs) and dicts (image docs).
+
+    Parameters:
+        file_paths (list of str): paths to .pdf, .docx, or image files
+
+    Returns:
+        documents (list): mix of str (text) and dict (image) per successfully loaded file
     """
     documents = []
     for path in file_paths:
@@ -204,20 +354,36 @@ def load_documents_from_files(file_paths: list) -> list:
             print(f"  [WARNING] File not found, skipping: {path}")
             continue
 
-        suffix = Path(path).suffix.lower()  # e.g. ".pdf" or ".docx"
+        suffix = Path(path).suffix.lower()  # e.g. ".pdf", ".docx", ".png"
 
         if suffix == ".pdf":
-            text = load_pdf(path)
+            # load_pdf now returns (text, img_pages) — handle both
+            text, img_pages = load_pdf(path)
+            if text.strip():
+                documents.append(text)
+            if img_pages:
+                # Scanned/image PDF pages returned as image dicts for the vision LLM
+                documents.extend(img_pages)
+                print(f"  [PDF] Added {len(img_pages)} image page(s) from: {path}")
+            if not text.strip() and not img_pages:
+                print(f"  [WARNING] No content extracted from: {path}")
+
         elif suffix in (".docx", ".doc"):
             text = load_docx(path)
+            if text.strip():
+                documents.append(text)
+            else:
+                print(f"  [WARNING] No text extracted from: {path}")
+
+        # [NEW] Image file support — these were previously logged as unsupported and skipped
+        elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            img_doc = load_image(path)
+            if img_doc:
+                documents.append(img_doc)  # append the image dict (not a string)
+
         else:
             print(f"  [WARNING] Unsupported file type '{suffix}', skipping: {path}")
             continue
-
-        if text.strip():
-            documents.append(text)
-        else:
-            print(f"  [WARNING] No text extracted from: {path}")
 
     return documents
 
@@ -330,7 +496,7 @@ DOCUMENTS = []
 # ]
 
 # =============================================================================
-# EXTERNAL FILES — Add your PDF / Word documents here
+# EXTERNAL FILES — Add your PDF / Word / Image documents here
 # =============================================================================
 #
 # HOW TO USE:
@@ -341,6 +507,7 @@ DOCUMENTS = []
 #   "C:\\Users\\sande\\Downloads\\my_document.pdf"
 #   "file:///C:/Users/sande/Downloads/my_document.pdf"
 #   "C:\\Users\\sande\\Documents\\notes.docx"
+#   "C:\\Users\\sande\\Pictures\\diagram.png"      ← [NEW] image files now supported
 #
 # You can add multiple files — one path per line, separated by commas.
 # Set the list to [] (empty) to use only the hardcoded study documents above.
@@ -371,44 +538,50 @@ if EXTERNAL_FILES:
 # - chunk_overlap: how many characters to repeat between consecutive chunks
 #                  Overlap helps avoid cutting a sentence mid-thought and
 #                  losing context at chunk boundaries.
+#
+# [CHANGED] This function now handles a mix of text strings and image dicts.
+# Image documents are NOT chunked — they pass through as single items.
+# Only text strings are split into overlapping chunks.
 
 def chunk_documents(documents, chunk_size=500, chunk_overlap=50):
     """
-    Split a list of documents into smaller overlapping text chunks.
+    Split text documents into overlapping chunks; pass image documents through unchanged.
+
+    [CHANGED] Previously, `documents` was always a list of strings.
+    Now it can contain image dicts (from load_image). Those are kept as-is
+    and appended to the chunks list directly, because an image cannot be
+    meaningfully split the way text can.
 
     Parameters:
-        documents    (list of str) : the raw text documents
-        chunk_size   (int)         : maximum characters per chunk
-        chunk_overlap(int)         : characters of overlap between adjacent chunks
+        documents    (list): str (text docs) or dict (image docs)
+        chunk_size   (int) : maximum characters per text chunk
+        chunk_overlap(int) : characters of overlap between adjacent text chunks
 
     Returns:
-        chunks (list of str) : all resulting text chunks across all documents
+        chunks (list): text strings OR image dicts
     """
-    chunks = []  # will collect all chunks from all documents
+    chunks = []
 
     for doc in documents:
-        # Strip leading/trailing whitespace from the document
+        # [NEW] If this item is an image dict, keep it as a single chunk
+        if isinstance(doc, dict) and doc.get("type") == "image":
+            chunks.append(doc)   # images are passed through without splitting
+            print(f"  [CHUNKING] Image kept as single chunk: {Path(doc['path']).name}")
+            continue
+
+        # Text document — apply the same fixed-size chunking as before
         doc = doc.strip()
 
-        # If the document fits within one chunk, add it directly
         if len(doc) <= chunk_size:
             chunks.append(doc)
             continue
 
-        # Otherwise, slide a window across the document
-        # start : where the current chunk begins
         start = 0
         while start < len(doc):
-            # end : where the current chunk ends (capped at doc length)
             end = min(start + chunk_size, len(doc))
-
-            # Extract the chunk and add it to our list
             chunk = doc[start:end].strip()
-            if chunk:  # skip empty strings
+            if chunk:
                 chunks.append(chunk)
-
-            # Move the window forward, stepping back by overlap amount
-            # so adjacent chunks share some context
             start += chunk_size - chunk_overlap
 
     return chunks
@@ -418,23 +591,45 @@ def chunk_documents(documents, chunk_size=500, chunk_overlap=50):
 # STEP 3 — EMBEDDING MODEL (HuggingFace / sentence-transformers)
 # =============================================================================
 #
-# The embedding model converts text → vector (a list of numbers).
-# We load the model ONCE at startup (it downloads ~80MB on first run,
-# then caches locally at ~/.cache/huggingface/).
-# Subsequent runs use the local cache — no internet needed after first load.
+# The embedding model converts text (or images) → vector (a list of numbers).
+# We load the model ONCE at startup.
+#
+# [CHANGED] Model changed from 'all-MiniLM-L6-v2' to 'clip-ViT-B-32'.
+#
+# WHY CLIP?
+# ---------
+# 'all-MiniLM-L6-v2' only understands text — it has no concept of images.
+# 'clip-ViT-B-32' (Contrastive Language-Image Pretraining) was trained by OpenAI
+# to align text and images in the same vector space. This means:
+#   - A text query like "cat diagram" produces a vector close to a cat image's vector
+#   - You can retrieve image chunks using text queries and vice versa
+# This is the key upgrade that makes multimodal RAG possible.
+#
+# CLIP dimensions: 512 (vs 384 for MiniLM)
+# CLIP download size: ~600MB (vs ~80MB for MiniLM)
 
-def load_embedding_model(model_name="all-MiniLM-L6-v2"):
+def load_embedding_model(model_name=None):
     """
     Load and return a SentenceTransformer embedding model.
 
+    [CHANGED] Default model changed from 'all-MiniLM-L6-v2' to 'clip-ViT-B-32'.
+    The old model name is kept as a comment below so you can see what was changed.
+
     Parameters:
-        model_name (str): HuggingFace model identifier
+        model_name (str): HuggingFace model identifier. Defaults to clip-ViT-B-32.
 
     Returns:
         model (SentenceTransformer): loaded embedding model
     """
+    # [OLD] Text-only model — commented out, replaced with CLIP below
+    # model_name = model_name or "all-MiniLM-L6-v2"
+    # print("  (First run downloads ~80MB. Subsequent runs use local cache.)")
+
+    # [NEW] Multimodal CLIP model — embeds both text AND images into the same space
+    model_name = model_name or "clip-ViT-B-32"
+
     print(f"\n[EMBEDDING] Loading model '{model_name}' from HuggingFace...")
-    print("  (First run downloads ~80MB. Subsequent runs use local cache.)")
+    print("  (First run downloads ~600MB for CLIP. Subsequent runs use local cache.)")
 
     # SentenceTransformer automatically downloads the model from HuggingFace Hub
     # and caches it at: C:\Users\<you>\.cache\huggingface\hub\  (Windows)
@@ -455,11 +650,50 @@ def embed_texts(model, texts):
     Returns:
         embeddings (np.ndarray): 2D array of shape (N, D)
                                  N = number of texts
-                                 D = embedding dimension (384 for MiniLM)
+                                 D = embedding dimension (512 for CLIP, 384 for MiniLM)
     """
     # model.encode() takes a list of strings and returns a numpy array
     # show_progress_bar=True prints a tqdm progress bar during encoding
     embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+    return embeddings
+
+
+def embed_chunks(model, chunks):
+    """
+    [NEW] Embed a mixed list of text strings and image dicts.
+
+    Why a separate function? embed_texts() only handles strings. When our chunks
+    list contains image dicts, we need to call model.encode() differently for each:
+      - Text chunks:  model.encode(text_string)  → 512-dim vector
+      - Image chunks: model.encode(PIL.Image)    → 512-dim vector
+    CLIP handles both through the same encode() call, but the input type differs.
+
+    Parameters:
+        model  (SentenceTransformer): CLIP model
+        chunks (list): mix of str and image dicts
+
+    Returns:
+        embeddings (np.ndarray): shape (N, 512) — one vector per chunk
+    """
+    inputs = []
+    for chunk in chunks:
+        if isinstance(chunk, dict) and chunk.get("type") == "image":
+            # [NEW] For image chunks, pass a PIL Image object to the CLIP encoder
+            # CLIP was trained to embed images and text into the same space,
+            # so model.encode(PIL_image) returns a 512-dim vector comparable to text vectors.
+            try:
+                import io
+                img_bytes = base64.b64decode(chunk["b64_data"])
+                pil_img = Image.open(io.BytesIO(img_bytes))
+                inputs.append(pil_img)
+            except Exception as e:
+                print(f"  [EMBED] Could not decode image {chunk.get('path')}: {e}")
+                inputs.append("")  # fallback: empty string gives near-zero vector
+        else:
+            # Text chunk — pass as string (same as before)
+            inputs.append(chunk if isinstance(chunk, str) else "")
+
+    embeddings = model.encode(inputs, show_progress_bar=True, convert_to_numpy=True)
     return embeddings
 
 
@@ -468,7 +702,7 @@ def embed_texts(model, texts):
 # =============================================================================
 #
 # A vector store stores:
-#   - the original text chunks
+#   - the original text chunks (now also image dicts)
 #   - their corresponding embedding vectors
 #
 # At search time, we:
@@ -480,18 +714,22 @@ def embed_texts(model, texts):
 #   similarity = (A · B) / (||A|| * ||B||)
 # Where A and B are vectors, · is dot product, ||.|| is the L2 norm (magnitude).
 # Result is between -1 and 1. For text, usually between 0 and 1.
+#
+# [NOTE] The vector store class itself is UNCHANGED — it works the same way
+# regardless of whether chunks are text strings or image dicts. Only the
+# embedding step above (embed_chunks) needed to change.
 
 class SimpleVectorStore:
     """
     A minimal in-memory vector store using numpy for cosine similarity search.
 
     Attributes:
-        chunks     (list of str)  : the text chunks
-        embeddings (np.ndarray)   : shape (N, D) — one row per chunk
+        chunks     (list): the text chunks (str) or image dicts
+        embeddings (np.ndarray): shape (N, D) — one row per chunk
     """
 
     def __init__(self):
-        self.chunks = []           # stores the text of each chunk
+        self.chunks = []           # stores the text of each chunk (or image dict)
         self.embeddings = None     # stores all embedding vectors as a 2D numpy array
 
     def add(self, chunks, embeddings):
@@ -499,8 +737,8 @@ class SimpleVectorStore:
         Add chunks and their precomputed embeddings to the store.
 
         Parameters:
-            chunks     (list of str) : text chunks
-            embeddings (np.ndarray)  : shape (N, D)
+            chunks     (list): text chunks or image dicts
+            embeddings (np.ndarray): shape (N, D)
         """
         self.chunks = chunks
         self.embeddings = embeddings
@@ -518,23 +756,10 @@ class SimpleVectorStore:
         Returns:
             similarities (np.ndarray): shape (N,) — similarity score per chunk
         """
-        # Compute dot products: query_vec · each row of doc_vecs
-        # np.dot(doc_vecs, query_vec) gives shape (N,)
         dot_products = np.dot(doc_vecs, query_vec)
-
-        # Compute the L2 norm (magnitude) of the query vector
-        # np.linalg.norm computes sqrt(sum of squares)
         query_norm = np.linalg.norm(query_vec)
-
-        # Compute the L2 norm of each document vector
-        # axis=1 means compute along each row → result shape (N,)
         doc_norms = np.linalg.norm(doc_vecs, axis=1)
-
-        # Avoid division by zero: replace any 0 norm with a tiny number
-        # np.maximum keeps the larger of two values element-wise
         doc_norms = np.maximum(doc_norms, 1e-10)
-
-        # Final cosine similarity: dot / (norm_query * norm_doc)
         similarities = dot_products / (query_norm * doc_norms)
         return similarities
 
@@ -544,22 +769,15 @@ class SimpleVectorStore:
 
         Parameters:
             query_embedding (np.ndarray): shape (D,) — the embedded user query
-            top_k (int)                 : number of top results to return
+            top_k (int): number of top results to return
 
         Returns:
-            results (list of dict): each dict has 'chunk' (str) and 'score' (float)
+            results (list of dict): each dict has 'chunk' (str or image dict) and 'score' (float)
         """
-        # Compute similarity of the query to all stored chunks
         scores = self.cosine_similarity(query_embedding, self.embeddings)
-
-        # argsort returns indices that would sort the array in ascending order
-        # [::-1] reverses it to get descending order (highest similarity first)
         ranked_indices = np.argsort(scores)[::-1]
-
-        # Take only the top-K indices
         top_indices = ranked_indices[:top_k]
 
-        # Build result list with chunk text and similarity score
         results = []
         for idx in top_indices:
             results.append({
@@ -576,9 +794,13 @@ class SimpleVectorStore:
 #
 # The retriever wraps the vector store and the embedding model together.
 # Given a raw text query (string), it:
-#   1. Embeds the query using the same model used to index documents
+#   1. Embeds the query using the same CLIP model used to index documents
 #   2. Searches the vector store for top-K similar chunks
 # This is the "R" in RAG.
+#
+# [NOTE] This function is UNCHANGED — it receives a text query and returns
+# top-K chunks (which may now be image dicts). The caller (generate_answer)
+# handles the mixed content.
 
 def retrieve(query, embedding_model, vector_store, top_k=3):
     """
@@ -586,15 +808,14 @@ def retrieve(query, embedding_model, vector_store, top_k=3):
 
     Parameters:
         query           (str)               : the user's question as plain text
-        embedding_model (SentenceTransformer): the loaded embedding model
+        embedding_model (SentenceTransformer): the loaded CLIP embedding model
         vector_store    (SimpleVectorStore) : the indexed vector store
         top_k           (int)               : how many chunks to retrieve
 
     Returns:
-        results (list of dict): top-K chunks with similarity scores
+        results (list of dict): top-K chunks (text or image) with similarity scores
     """
-    # Embed the query — same model used for indexing, so vectors are comparable
-    # encode() can take a single string or a list; returns shape (D,) for one string
+    # Embed the query — same CLIP model used for indexing, so vectors are comparable
     query_embedding = embedding_model.encode(query, convert_to_numpy=True)
 
     # Search the vector store for the most similar chunks
@@ -604,47 +825,52 @@ def retrieve(query, embedding_model, vector_store, top_k=3):
 
 
 # =============================================================================
-# STEP 6 — GENERATOR (Groq + LLaMA3)
+# STEP 6 — GENERATOR (Groq + LLaMA3-Vision)
 # =============================================================================
 #
 # The generator takes:
-#   - the retrieved context chunks
+#   - the retrieved context chunks (now possibly including images)
 #   - the user's question
 # and calls the Groq API to produce a final answer.
 #
-# We construct a prompt with:
-#   - a SYSTEM message: sets the LLM's behavior (answer only from context)
-#   - a USER message  : contains the context + question
+# [CHANGED] Model changed from 'llama-3.1-8b-instant' to 'meta-llama/llama-4-scout-17b-16e-instruct'.
 #
-# The model: llama3-8b-8192
-#   "llama3"   = Meta's LLaMA 3 model family
-#   "8b"       = 8 billion parameters (size of the model)
-#   "8192"     = maximum context window in tokens
+# WHY THE NEW MODEL?
+# ------------------
+# 'llama-3.1-8b-instant' only understands text. If an image chunk is retrieved,
+# the old model would have no way to reason about it.
+# 'meta-llama/llama-4-scout-17b-16e-instruct' (LLaMA 3.2 11B Vision) is a multimodal model
+# that can process base64-encoded images alongside text in the same API call.
+# This is done using the OpenAI-style multi-content message format:
+#
+#   {"role": "user", "content": [
+#       {"type": "text", "text": "Here is an image:"},
+#       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<b64>"}},
+#       {"type": "text", "text": "QUESTION: ..."},
+#   ]}
+#
+# The old text-only message format is kept as a comment below for reference.
 
-def generate_answer(question, retrieved_chunks, groq_client, model="llama-3.1-8b-instant"):
+def generate_answer(question, retrieved_chunks, groq_client,
+                    model="meta-llama/llama-4-scout-17b-16e-instruct"):
     """
-    Generate an answer using the Groq LLM, grounded in retrieved context.
+    Generate an answer using the Groq vision-capable LLM, grounded in retrieved context.
+
+    [CHANGED]
+    - Default model changed from 'llama-3.1-8b-instant' to 'meta-llama/llama-4-scout-17b-16e-instruct'
+    - User message now uses the multi-content format (list of content blocks) instead of
+      a plain text string, so images can be included alongside text.
 
     Parameters:
-        question         (str)        : the user's original question
-        retrieved_chunks (list of dict): output of retrieve() — chunks + scores
-        groq_client      (Groq)       : authenticated Groq API client
-        model            (str)        : Groq model ID to use
+        question         (str)          : the user's original question
+        retrieved_chunks (list of dict) : output of retrieve() — chunks (text or image) + scores
+        groq_client      (Groq)         : authenticated Groq API client
+        model            (str)          : Groq model ID to use
 
     Returns:
         answer (str): the LLM's generated response
     """
-    # --- Build the context string from retrieved chunks ---
-    # Join all retrieved chunk texts, numbered for clarity
-    context_parts = []
-    for i, result in enumerate(retrieved_chunks, start=1):
-        context_parts.append(f"[Chunk {i} | similarity: {result['score']:.3f}]\n{result['chunk']}")
-
-    # Join all parts with a separator line
-    context_text = "\n\n---\n\n".join(context_parts)
-
-    # --- System message ---
-    # This tells the LLM how to behave. "Only use the context" reduces hallucination.
+    # --- System message (unchanged) ---
     system_message = (
         "You are a helpful AI assistant specializing in explaining RAG concepts. "
         "Answer the user's question ONLY based on the provided context below. "
@@ -652,34 +878,80 @@ def generate_answer(question, retrieved_chunks, groq_client, model="llama-3.1-8b
         "Do not use any knowledge outside of what is in the context."
     )
 
-    # --- User message ---
-    # This is what the LLM "sees" as the human turn. Context comes first, then question.
-    user_message = (
-        f"CONTEXT (retrieved from knowledge base):\n"
-        f"{'='*60}\n"
-        f"{context_text}\n"
-        f"{'='*60}\n\n"
-        f"QUESTION: {question}"
-    )
+    # --- Build the user message content as a list of content blocks ---
+    # [CHANGED] Previously this was a single string:
+    #   user_message = f"CONTEXT:\n...\nQUESTION: {question}"
+    #
+    # Now it is a list of dicts (content blocks) following the vision API format.
+    # This lets us interleave text descriptions and base64 images freely.
+
+    content_blocks = []
+
+    # Opening context header (text block)
+    content_blocks.append({
+        "type": "text",
+        "text": "CONTEXT (retrieved from knowledge base):\n" + "=" * 60
+    })
+
+    # Add each retrieved chunk as either a text block or an image block
+    for i, result in enumerate(retrieved_chunks, start=1):
+        chunk = result["chunk"]
+        score = result["score"]
+
+        if isinstance(chunk, dict) and chunk.get("type") == "image":
+            # [NEW] Image chunk — add a text label then the image content block
+            content_blocks.append({
+                "type": "text",
+                "text": f"\n[Image {i} | similarity: {score:.3f}] (from: {Path(chunk['path']).name})"
+            })
+            # The Groq vision API uses 'image_url' with a data URI for base64 images.
+            # Format: "data:<mime_type>;base64,<base64_string>"
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{chunk['mime_type']};base64,{chunk['b64_data']}"
+                }
+            })
+        else:
+            # Text chunk — same as before but now as a content block dict
+            chunk_text = chunk if isinstance(chunk, str) else ""
+            content_blocks.append({
+                "type": "text",
+                "text": f"\n[Chunk {i} | similarity: {score:.3f}]\n{chunk_text}"
+            })
+
+    # Closing separator and the user's question
+    content_blocks.append({
+        "type": "text",
+        "text": "\n" + "=" * 60 + f"\n\nQUESTION: {question}"
+    })
 
     # --- Call the Groq API ---
-    # groq_client.chat.completions.create() follows the OpenAI Chat Completions format.
-    # messages: a list of role/content dicts — "system" sets behavior, "user" is the input.
-    # max_tokens: cap the response length (prevents runaway generation).
-    # temperature: controls randomness. 0.2 = mostly deterministic, focused answers.
+    # [CHANGED] 'content' is now a list of content blocks (supports images),
+    # not a plain string. This is the key structural change from the old code.
+    #
+    # [OLD] Plain text message format — worked only for text:
+    # response = groq_client.chat.completions.create(
+    #     model="llama-3.1-8b-instant",
+    #     messages=[
+    #         {"role": "system", "content": system_message},
+    #         {"role": "user",   "content": user_message},   ← plain string
+    #     ],
+    #     max_tokens=512,
+    #     temperature=0.9,
+    # )
+
+    # [NEW] Multi-content message format — supports text + images:
     response = groq_client.chat.completions.create(
-        model=model,
+        model=model,                       # meta-llama/llama-4-scout-17b-16e-instruct
         messages=[
             {"role": "system", "content": system_message},
-            {"role": "user",   "content": user_message},
+            {"role": "user",   "content": content_blocks},  # ← list of blocks
         ],
-        max_tokens=512,   # maximum tokens in the generated response
-        temperature=0.9,  # low temperature → more focused, less creative
+        max_tokens=512,
+        temperature=0.9,
     )
 
-    # Extract the answer text from the response object
-    # response.choices[0] — first (and usually only) completion choice
-    # .message.content    — the generated text string
     answer = response.choices[0].message.content
     return answer
 
@@ -689,43 +961,33 @@ def generate_answer(question, retrieved_chunks, groq_client, model="llama-3.1-8b
 # =============================================================================
 #
 # This function runs the full RAG pipeline:
-#   1. Load and chunk documents
-#   2. Load embedding model
-#   3. Embed all chunks and build the vector store (indexing phase)
-#   4. Set up the Groq LLM client
+#   1. Load and chunk documents (now including images)
+#   2. Load CLIP embedding model (multimodal)
+#   3. Embed all chunks (text and images) and build the vector store
+#   4. Set up the Groq LLM client (vision-capable model)
 #   5. Enter an interactive Q&A loop in the terminal
 
 def main():
     print("=" * 65)
     print("  RAG DEMO — Retrieval-Augmented Generation (Study Edition)")
-    print("  LLM: Groq / LLaMA-3.1-8B-Instant   |   Embeddings: MiniLM-L6-v2")
+    # [CHANGED] Updated banner to reflect new models
+    print("  LLM: Groq / LLaMA-3.2-11B-Vision   |   Embeddings: CLIP-ViT-B-32")
+    # [OLD] print("  LLM: Groq / LLaMA-3.1-8B-Instant   |   Embeddings: MiniLM-L6-v2")
     print("=" * 65)
 
     # -------------------------------------------------------------------------
-    # 7a. Read the Groq API key — checks two places in order:
-    #       1. Environment variable GROQ_API_KEY  (set in your terminal session)
-    #       2. A .env file in the same folder as this script
-    #
-    # The .env file format is simply one line:
-    #       GROQ_API_KEY=your_key_here
+    # 7a. Read the Groq API key
     # -------------------------------------------------------------------------
-
-    api_key = os.environ.get("GROQ_API_KEY")  # Check environment variable first
+    api_key = os.environ.get("GROQ_API_KEY")
 
     if not api_key:
-        # Path(__file__) is the absolute path to this script file.
-        # .parent gives the folder that contains it.
-        # / ".env" appends the filename — this builds: <script_folder>/.env
         env_file = Path(__file__).parent / ".env"
 
         if env_file.exists():
-            # Read every line in the .env file
             for line in env_file.read_text().splitlines():
                 line = line.strip()
-                # Skip blank lines and comment lines (starting with #)
                 if not line or line.startswith("#"):
                     continue
-                # Split on the first "=" only, so values can contain "=" characters
                 if "=" in line:
                     key, _, value = line.partition("=")
                     if key.strip() == "GROQ_API_KEY":
@@ -745,88 +1007,87 @@ def main():
         sys.exit(1)
 
     if not api_key.startswith("gsk_"):
-        # Groq API keys always start with "gsk_" — catch obvious mistakes early
         print(f"\nWARNING: Key doesn't look like a Groq key (expected 'gsk_...').")
         print("Continuing anyway — the API call will fail if the key is wrong.")
     else:
         print(f"\n[API] Groq API key found (ends with ...{api_key[-6:]}).")
 
     # -------------------------------------------------------------------------
-    # 7b. Chunk the hardcoded documents
+    # 7b. Chunk the documents (text is split; images pass through as-is)
     # -------------------------------------------------------------------------
     print("\n[CHUNKING] Splitting documents into chunks...")
     chunks = chunk_documents(DOCUMENTS, chunk_size=500, chunk_overlap=50)
-    print(f"[CHUNKING] Created {len(chunks)} chunks from {len(DOCUMENTS)} documents.")
+    text_chunks = [c for c in chunks if isinstance(c, str)]
+    image_chunks = [c for c in chunks if isinstance(c, dict)]
+    print(f"[CHUNKING] Created {len(text_chunks)} text chunks + {len(image_chunks)} image chunks.")
 
-    # Show a sample chunk so the user understands what chunking produces
-    print(f"\n[CHUNKING] Sample chunk (chunk #1 of {len(chunks)}):")
-    print("-" * 40)
-    print(textwrap.fill(chunks[0], width=60))
-    print("-" * 40)
+    if chunks:
+        first_text = next((c for c in chunks if isinstance(c, str)), None)
+        if first_text:
+            print(f"\n[CHUNKING] Sample chunk (first text chunk):")
+            print("-" * 40)
+            print(textwrap.fill(first_text, width=60))
+            print("-" * 40)
 
     # -------------------------------------------------------------------------
-    # 7c. Load HuggingFace embedding model
+    # 7c. Load CLIP embedding model
+    # [CHANGED] Now loads clip-ViT-B-32 instead of all-MiniLM-L6-v2
     # -------------------------------------------------------------------------
-    embedding_model = load_embedding_model("all-MiniLM-L6-v2")
+    embedding_model = load_embedding_model()  # defaults to clip-ViT-B-32
+    # [OLD] embedding_model = load_embedding_model("all-MiniLM-L6-v2")
 
     # -------------------------------------------------------------------------
-    # 7d. Embed all chunks and build the vector store (INDEXING phase)
+    # 7d. Embed all chunks (text and images) and build the vector store
+    # [CHANGED] Now uses embed_chunks() instead of embed_texts() to handle images
     # -------------------------------------------------------------------------
     print("\n[INDEXING] Embedding all chunks — this is the INDEXING phase...")
-    print("  (Each chunk is converted to a 384-dimensional vector.)")
+    print("  (Each chunk is converted to a 512-dimensional CLIP vector.)")
+    # [OLD] print("  (Each chunk is converted to a 384-dimensional vector.)")
 
-    # embed_texts() returns shape (N, 384) where N = number of chunks
-    chunk_embeddings = embed_texts(embedding_model, chunks)
+    # [CHANGED] embed_chunks() handles mixed text + image input
+    # [OLD] chunk_embeddings = embed_texts(embedding_model, chunks)
+    chunk_embeddings = embed_chunks(embedding_model, chunks)
 
-    # Build the in-memory vector store
     vector_store = SimpleVectorStore()
     vector_store.add(chunks, chunk_embeddings)
 
     # -------------------------------------------------------------------------
     # 7e. Set up the Groq API client
     # -------------------------------------------------------------------------
-    # Groq(api_key=...) creates an authenticated client.
-    # All subsequent API calls go through this object.
     print("\n[LLM] Connecting to Groq API...")
     groq_client = Groq(api_key=api_key)
-    print("[LLM] Groq client ready. Model: llama-3.1-8b-instant")
+    print("[LLM] Groq client ready. Model: meta-llama/llama-4-scout-17b-16e-instruct")
+    # [OLD] print("[LLM] Groq client ready. Model: llama-3.1-8b-instant")
 
     # -------------------------------------------------------------------------
     # 7f. Interactive Q&A loop
     # -------------------------------------------------------------------------
     print("\n" + "=" * 65)
-    print("  RAG SYSTEM READY — Ask questions about RAG!")
+    print("  RAG SYSTEM READY — Ask questions about your documents + images!")
     print("  Type 'quit' or 'exit' to stop.")
     print("=" * 65)
 
-    # Suggested starter questions the user can try:
     print("\nSuggested questions to try:")
     print("  • What is RAG?")
     print("  • How does cosine similarity work?")
     print("  • What is chunking and why is it needed?")
     print("  • What is an embedding?")
-    print("  • How does Groq relate to RAG?")
-    print("  • What causes hallucination in LLMs?")
+    print("  • Describe what you see in the uploaded image.")
 
     while True:
-        # Prompt the user for input in the terminal
         print()
         try:
             user_question = input("Your question: ").strip()
         except (EOFError, KeyboardInterrupt):
-            # Handle Ctrl+C or Ctrl+D gracefully
             print("\n\n[EXIT] Interrupted. Goodbye!")
             break
 
-        # Check for exit commands
         if user_question.lower() in ("quit", "exit", "q", ""):
             print("\n[EXIT] Goodbye! Thanks for studying RAG.")
             break
 
         print(f"\n[RETRIEVAL] Searching for relevant chunks for: '{user_question}'")
 
-        # --- RETRIEVAL phase ---
-        # Find the top-3 most relevant chunks from the vector store
         results = retrieve(
             query=user_question,
             embedding_model=embedding_model,
@@ -834,35 +1095,36 @@ def main():
             top_k=3
         )
 
-        # Show the retrieved chunks so the user can see what the LLM receives
         print("\n[RETRIEVAL] Top-3 chunks retrieved:")
         for i, r in enumerate(results, start=1):
-            print(f"\n  Chunk {i} (similarity score: {r['score']:.4f}):")
-            print("  " + "-" * 50)
-            # textwrap.fill wraps long text to a given line width
-            wrapped = textwrap.fill(r['chunk'], width=60, initial_indent="  ", subsequent_indent="  ")
-            print(wrapped)
-            print("  " + "-" * 50)
+            chunk = r["chunk"]
+            if isinstance(chunk, dict) and chunk.get("type") == "image":
+                print(f"\n  Chunk {i} (similarity score: {r['score']:.4f}): [IMAGE] {chunk['path']}")
+            else:
+                print(f"\n  Chunk {i} (similarity score: {r['score']:.4f}):")
+                print("  " + "-" * 50)
+                wrapped = textwrap.fill(chunk, width=60, initial_indent="  ", subsequent_indent="  ")
+                print(wrapped)
+                print("  " + "-" * 50)
 
-        # --- GENERATION phase ---
-        print("\n[GENERATION] Sending context + question to Groq (LLaMA-3.1-8B-Instant)...")
+        print("\n[GENERATION] Sending context + question to Groq (LLaMA-3.2-11B-Vision)...")
+        # [OLD] print("\n[GENERATION] Sending context + question to Groq (LLaMA-3.1-8B-Instant)...")
         try:
             answer = generate_answer(
                 question=user_question,
                 retrieved_chunks=results,
                 groq_client=groq_client,
-                model="llama-3.1-8b-instant"
+                model="meta-llama/llama-4-scout-17b-16e-instruct"
+                # [OLD] model="llama-3.1-8b-instant"
             )
         except Exception as e:
-            # Catch API errors (network issues, invalid key, rate limits, etc.)
             print(f"\n[ERROR] Groq API call failed: {e}")
             continue
 
-        # Print the final answer
         print("\n" + "=" * 65)
-        print("  ANSWER (generated by LLaMA3-8B via Groq):")
+        print("  ANSWER (generated by LLaMA3.2-11B-Vision via Groq):")
+        # [OLD] print("  ANSWER (generated by LLaMA3-8B via Groq):")
         print("=" * 65)
-        # textwrap.fill wraps the answer to 65 chars wide for clean terminal output
         print(textwrap.fill(answer, width=65))
         print("=" * 65)
 
@@ -870,8 +1132,5 @@ def main():
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
-# This block ensures main() only runs when the script is executed directly
-# (not when it is imported as a module by another script).
-
 if __name__ == "__main__":
     main()
